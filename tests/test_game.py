@@ -41,7 +41,7 @@ except ValueError:
 
 # раздача карточек
 g = mk(12)
-ok(all(set(p.traits) == set(G.TRAIT_KEYS) for p in g.players.values()), "у каждого 7 характеристик")
+ok(len(G.TRAIT_KEYS) == 8 and all(set(p.traits) == set(G.TRAIT_KEYS) for p in g.players.values()), "у каждого 8 характеристик, включая характер")
 ok(len({p.traits['profession'].text for p in g.players.values()}) == 12, "профессии не повторяются")
 ok(all(p.card in G.CARDS for p in g.players.values()), "у каждого особая карта")
 ok(g.seats == 6 and g.needs and g.catastrophe and g.bunker, "сценарий: места, потребности, катастрофа, бункер")
@@ -87,7 +87,7 @@ for v in (1, 2, 3):
     g.cast_vote(v, 5)
 g.cast_vote(4, 1); g.cast_vote(5, 1)
 t = g.tally(); ok(t.kind == "eliminate" and t.player.user_id == 5 and t.counts[5] == 3, "исключён лидер по голосам")
-ok(t.voters[5] == ["p1", "p2", "p3"], "список проголосовавших")
+ok(t.voters[5] == [(1, 1), (2, 1), (3, 1)], "список проголосовавших с весом голоса")
 g.cast_vote(1, 2)
 ok(g.votes[1] == 2, "голос можно изменить")
 
@@ -110,7 +110,7 @@ t = g.tally(); ok(t.kind == "random" and t.player.alive, "нет голосов 
 g = mk(5, seed=3); g.begin_round(); g.begin_voting()
 g.double.add(1)
 g.cast_vote(1, 2); g.cast_vote(3, 4); g.cast_vote(5, 4); g.cast_vote(2, 4); g.cast_vote(4, 2)
-t = g.tally(); ok(t.counts[2] == 3 and t.counts[4] == 3, "двойной голос считается как два (3:3)")
+t = g.tally(); ok(t.counts[2] == 3 and t.counts[4] == 3 and (1, 2) in t.voters[2], "двойной голос считается как два (3:3)")
 ok(t.kind == "tie", "с двойным голосом возможна ничья")
 
 
@@ -135,7 +135,8 @@ ok(g.tally().player.user_id == 3, "иммунитет: исключён друг
 g = card_game("double"); r = g.play_card(1); ok(r.ok and 1 in g.double and not r.public, "двойной голос: скрытое действие")
 
 g = card_game("reveal"); r = g.play_card(1, target_id=2)
-ok(r.ok and len(g.players[2].opened) == 2 and "Принудительное раскрытие" in r.public, "принудительное раскрытие: публично")
+ok(r.ok and len(g.players[2].opened) == 2 and "Принудительное раскрытие" in r.public
+   and r.code == "reveal" and r.target_id == 2 and r.key in g.players[2].opened, "принудительное раскрытие: публично, с данными для бота")
 ok(not card_game("reveal").play_card(1, target_id=1).ok, "раскрытие: нельзя выбрать себя")
 ok(not card_game("reveal").play_card(1).ok, "раскрытие: нужна цель")
 
@@ -155,6 +156,44 @@ g.start(3)
 for p in g.players.values():
     p.card = "double"
 ok(not g.play_card(1).ok, "карту нельзя использовать вне обсуждения/голосования")
+
+# характер и username
+g = G.BunkerGame(random.Random(3))
+g.add_player(1, "Аня", 12, "anya_b"); g.add_player(2, "Боб", 12)
+ok(g.players[1].username == "anya_b" and g.players[2].username is None, "username сохраняется")
+for i in range(3, 13):
+    g.add_player(i, f"p{i}", 12)
+g.start(5)
+import content as C  # noqa: E402
+chars = {c[0] for c in C.CHARACTERS}
+ok(all(p.traits["character"].text in chars for p in g.players.values()), "характер выдаётся из списка")
+ok(len({p.traits["character"].text for p in g.players.values()}) == 12, "характеры у игроков не повторяются")
+
+# действия ведущего
+g = mk(6, seed=21); g.begin_round()
+old_text = g.players[2].traits["health"].text
+old, new = g.replace_trait(2, "health")
+ok(old == old_text and new != old and g.players[2].traits["health"].text == new, "ведущий заменяет характеристику")
+old_p, new_p = g.replace_trait(2, "profession")
+ok("profession" in g.players[2].opened and new_p != old_p and g.players[2].traits["profession"].text == new_p,
+   "замена уже раскрытой характеристики тоже работает")
+v = g.force_open(3, "phobia")
+ok("phobia" in g.players[3].opened and v == g.players[3].traits["phobia"].text, "ведущий раскрывает характеристику")
+try:
+    g.force_open(3, "phobia"); ok(False, "повторное раскрытие")
+except ValueError:
+    ok(True, "повторно раскрыть нельзя")
+g.begin_voting(); g.cast_vote(4, 5); g.cast_vote(5, 4)
+out = g.kick(4)
+ok(not out.alive and 4 not in g.votes and g.elimination_order[-1] == 4, "исключение ведущим убирает голос исключённого")
+t = g.tally()
+ok(4 not in t.counts and t.player.user_id != 4, "голоса за исключённого не учитываются")
+for f, a in ((g.kick, (4,)), (g.replace_trait, (4, "health")), (g.force_open, (4, "bio"))):
+    try:
+        f(*a); ok(False, "действие над исключённым")
+    except ValueError:
+        pass
+ok(True, "над исключённым действия ведущего запрещены")
 
 # конец игры и вердикт
 g = mk(6, seed=11); g.begin_round()

@@ -28,15 +28,20 @@ class Storage:
 
     def profile(self, user_id):
         data = self._load(self.profiles_path, {})
-        return data.get(str(user_id), {"name": "", "games": 0, "survived": 0, "eliminated": 0,
-                                       "professions": {}})
+        p = data.get(str(user_id), {"name": "", "games": 0, "survived": 0, "eliminated": 0,
+                                    "professions": {}})
+        p.setdefault("wins", p["survived"])   # старые записи: победа = попадание в бункер
+        return p
 
-    def record_game(self, players, scenario, seats, rating):
-        """players: список (user_id, имя, выжил, профессия)"""
+    def record_game(self, players, scenario, seats, rating, winner="inside"):
+        """players: список (user_id, имя, попал в бункер, профессия, победил)"""
         data = self._load(self.profiles_path, {})
-        for user_id, name, survived, profession in players:
+        for user_id, name, survived, profession, won in players:
             p = data.get(str(user_id), {"name": name, "games": 0, "survived": 0,
                                         "eliminated": 0, "professions": {}})
+            p.setdefault("wins", p["survived"])
+            if won:
+                p["wins"] += 1
             p["name"] = name
             p["games"] += 1
             if survived:
@@ -53,15 +58,18 @@ class Storage:
             "scenario": scenario,
             "seats": seats,
             "rating": rating,
-            "players": [{"id": u, "name": n, "survived": s, "profession": pr}
-                        for u, n, s, pr in players],
+            "winner": winner,
+            "players": [{"id": u, "name": n, "survived": s, "profession": pr, "won": w}
+                        for u, n, s, pr, w in players],
         })
         self._save(self.history_path, history[-50:])
 
     def top(self, limit=10, min_games=1):
         data = self._load(self.profiles_path, {})
         rows = [(int(uid), p) for uid, p in data.items() if p.get("games", 0) >= min_games]
-        rows.sort(key=lambda r: (r[1]["survived"], r[1]["survived"] / max(1, r[1]["games"])), reverse=True)
+        for _, p in rows:
+            p.setdefault("wins", p["survived"])
+        rows.sort(key=lambda r: (r[1]["wins"], r[1]["wins"] / max(1, r[1]["games"])), reverse=True)
         return rows[:limit]
 
     def history(self, limit=5):

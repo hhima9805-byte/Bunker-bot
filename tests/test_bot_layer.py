@@ -22,6 +22,9 @@ class _F:
     def startswith(self, prefix):
         return ("startswith", prefix)
 
+    def __call__(self, *a, **k):
+        return self
+
     __hash__ = object.__hash__
 
 
@@ -79,6 +82,7 @@ def install():
     tps = types.ModuleType("aiogram.types")
     tps.BotCommand = Obj; tps.CallbackQuery = Obj; tps.InlineKeyboardButton = Obj
     tps.InlineKeyboardMarkup = Obj; tps.Message = Message
+    tps.BufferedInputFile = lambda data, filename: Obj(data=data, filename=filename)
     sys.modules.update({"aiogram": a, "aiogram.client": client, "aiogram.client.default": default,
                         "aiogram.enums": enums, "aiogram.exceptions": exc, "aiogram.filters": filters,
                         "aiogram.types": tps})
@@ -109,6 +113,15 @@ class FakeBot:
         self.forbidden = set()
         self.retry_once = set()
         self.admins = set()
+        self.bot_can_delete = False
+        self.deleted = []
+        self.BOT_ID = 999
+
+    async def me(self):
+        return Obj(id=self.BOT_ID, username="bunker_test_bot")
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
 
     async def send_message(self, chat_id, text, reply_markup=None):
         if chat_id in self.forbidden:
@@ -121,10 +134,23 @@ class FakeBot:
         self.sent.append((chat_id, text, reply_markup, mid))
         return Obj(message_id=mid)
 
+    async def send_photo(self, chat_id, photo, caption=None, reply_markup=None):
+        if chat_id in self.forbidden:
+            raise TelegramForbiddenError("bot was blocked by the user")
+        if chat_id in self.retry_once:
+            self.retry_once.discard(chat_id)
+            raise TelegramRetryAfter(0.01)
+        mid = self.next_id; self.next_id += 1
+        self.photos = getattr(self, "photos", []) + [(chat_id, photo, caption, reply_markup, mid)]
+        return Obj(message_id=mid)
+
     async def edit_message_text(self, text, chat_id, message_id, reply_markup=None):
         self.edits.append((chat_id, message_id, text, reply_markup))
 
     async def get_chat_member(self, chat_id, user_id):
+        if user_id == self.BOT_ID:
+            return Obj(status="administrator" if self.bot_can_delete else "member",
+                       can_delete_messages=self.bot_can_delete)
         return Obj(status="administrator" if user_id in self.admins else "member")
 
     def texts(self, chat):
@@ -134,7 +160,7 @@ class FakeBot:
 fb = FakeBot()
 B.engine = Engine(B.TelegramMessenger(fb), Storage(tempfile.mkdtemp()),
                   Settings(min_players=5, open_seconds=5, discuss_seconds=5, vote_seconds=5,
-                           revote_seconds=5, edit_interval=0), bot_username="bunker_test_bot")
+                           revote_seconds=5, edit_interval=0, notice_interval=60), bot_username="bunker_test_bot")
 E = B.engine
 GROUP = -100777
 
@@ -147,11 +173,26 @@ class Answers:
         self.items.append((text, kw.get("show_alert")))
 
 
-def msg(user_id, chat_id, chat_type="supergroup", name=None):
+_next_msg_id = [10000]
+
+
+def msg(user_id, chat_id, chat_type="supergroup", name=None, username=None, sender_chat=None, service=False):
     m = Message()
-    m.from_user = Obj(id=user_id, full_name=name or f"User{user_id}")
-    m.chat = Obj(id=chat_id, type=chat_type)
+    m.from_user = Obj(id=user_id, full_name=name or f"User{user_id}", username=username)
+    m.chat = Obj(id=chat_id, type=chat_type, title="Тестовая группа")
+    m.sender_chat = sender_chat
+    m.new_chat_members = [m.from_user] if service else None
+    m.left_chat_member = None
     m.answers = []
+    _next_msg_id[0] += 1
+    m.message_id = _next_msg_id[0]
+    m.deleted = False
+
+    async def delete():
+        if not fb.bot_can_delete:
+            raise TelegramBadRequest("not enough rights")
+        m.deleted = True
+    m.delete = delete
 
     async def answer(text, **kw):
         m.answers.append(text)
@@ -216,12 +257,13 @@ m = msg(1, 1, "private"); run(B.cmd_bunker(m))
 ok("групповом чате" in m.answers[0], "/bunker в личке объясняет, что нужно в группе")
 m = msg(1, GROUP); run(B.cmd_bunker(m))
 ok(GROUP in E.sessions and any("Набор игроков" in t for t in fb.texts(GROUP)), "/bunker в группе открывает набор")
+ok(any("Удаление сообщений" in a for a in m.answers), "без прав на удаление бот сразу предупреждает")
 lobby_kb = [mk for c, t, mk, _ in fb.sent if c == GROUP][-1]
 ok(lobby_kb.inline_keyboard[0][0].url == f"https://t.me/bunker_test_bot?start=join_{GROUP}", "кнопка «Войти» — ссылка с кодом чата")
 m = msg(1, GROUP); run(B.cmd_bunker(m)); ok("уже идёт" in m.answers[0], "второй /bunker в том же чате отклонён")
 
 for uid in range(100, 105):
-    m = msg(uid, uid, "private", name=f"Игрок{uid}")
+    m = msg(uid, uid, "private", name=f"Игрок{uid}", username=f"user_{uid}")
     run(B.cmd_start(m, Obj(args=f"join_{GROUP}")))
     ok("Вы записаны" in m.answers[0], f"/start join_ записывает игрока {uid}")
 m = msg(200, 200, "private"); run(B.cmd_start(m, Obj(args="join_abc")))
@@ -239,6 +281,8 @@ m = msg(104, 104, "private", name="Игрок104"); run(B.cmd_start(m, Obj(args=
 fb.admins.add(100)
 c = cb(100, GROUP, "lobby:start"); run(B.cb_lobby_start(c))
 ok(c.answer.items[0] == ("Игра начинается.", False), "администратор чата может начать игру")
+ok(any("Удаление сообщений" in t for t in fb.texts(GROUP)), "при старте без прав — предупреждение в чат")
+ok(E.sessions[GROUP].game.players[100].username == "user_100", "username игрока передаётся в игру")
 g = E.sessions[GROUP].game
 ok(all(any("секретная карточка" in t for t in fb.texts(u)) for u in range(100, 105)), "карточки дошли всем в личку")
 
@@ -251,6 +295,24 @@ async def until(cond, timeout=3):
     return False
 
 ok(run(until(lambda: g.phase == G.DISCUSSION)), "игра дошла до обсуждения")
+
+# тишина в чате
+m = msg(100, GROUP); run(B.group_guard(m)); ok(not m.deleted, "без прав бот ничего не удаляет и не падает")
+fb.bot_can_delete = True
+m = msg(100, GROUP); run(B.group_guard(m)); ok(not m.deleted, "сообщение игрока остаётся")
+m = msg(500, GROUP, name="Владелец", username="owner_x"); run(B.group_guard(m))
+ok(m.deleted and any("сейчас идёт игра" in t for t in fb.texts(500)), "сообщение зрителя (владельца) удалено, в личку пришло уведомление")
+n_before = len(fb.texts(500))
+m = msg(500, GROUP); run(B.group_guard(m))
+ok(m.deleted and len(fb.texts(500)) == n_before, "повторное уведомление не шлётся чаще раза в минуту")
+fb.forbidden.add(501)
+m = msg(501, GROUP, name="Админ", username="admin_y"); run(B.group_guard(m))
+note = [(c, t, mid) for c, t, _, mid in fb.sent if c == GROUP and "@admin_y, сейчас идёт игра" in t]
+ok(m.deleted and note, "личка закрыта: короткое уведомление в чат с упоминанием")
+run(asyncio.sleep(0))
+m = msg(0, GROUP, sender_chat=Obj(id=GROUP)); run(B.group_guard(m)); ok(m.deleted, "анонимный админ: сообщение удалено")
+m = msg(502, GROUP, service=True); run(B.group_guard(m)); ok(not m.deleted, "служебные сообщения о входе не трогаются")
+m = msg(503, -42); run(B.group_guard(m)); ok(not m.deleted, "в группе без игры ничего не удаляется")
 ok(run(until(lambda: any("Стол" in t for t in fb.texts(GROUP)))), "стол показан")
 m = msg(5, GROUP); run(B.cmd_table(m)); ok("<b>Стол</b>" in m.answers[0], "/table показывает стол")
 
@@ -303,11 +365,67 @@ for cmd in (B.cmd_help, B.cmd_rules, B.cmd_profile, B.cmd_top, B.cmd_history):
 cb_lost = Obj(from_user=Obj(id=1), data="ready", bot=fb, message=None); cb_lost.answer = Answers()
 run(B.cb_ready(cb_lost)); ok(cb_lost.answer.items[0][1] is True, "кнопка из недоступного старого сообщения не роняет бота")
 
+# режим ведущего через кнопки
+m = msg(7, GROUP); run(B.cmd_bunker(m))
+c = cb(100, GROUP, "lobby:host"); run(B.cb_lobby_host(c)); ok(c.answer.items[0][1] is True, "режим ведущего: только создатель")
+c = cb(7, GROUP, "lobby:host"); run(B.cb_lobby_host(c))
+ok(c.answer.items[0][1] is False and E.sessions[GROUP].host_mode, "создатель включил режим ведущего кнопкой")
+for uid in range(100, 105):
+    run(B.cmd_start(msg(uid, uid, "private", name=f"Игрок{uid}", username=f"user_{uid}"), Obj(args=f"join_{GROUP}")))
+m = msg(7, 7, "private"); run(B.cmd_start(m, Obj(args=f"join_{GROUP}")))
+ok("Вы ведущий" in m.answers[0], "ведущий не может записаться игроком")
+run(B.cb_lobby_start(cb(7, GROUP, "lobby:start")))
+g = E.sessions[GROUP].game
+ok(any("Панель ведущего" in t for t in fb.texts(7)), "ведущему пришла панель")
+ok(run(until(lambda: g.phase == G.DISCUSSION)), "игра с ведущим идёт")
+m = msg(7, GROUP); run(B.group_guard(m)); ok(m.deleted, "сообщение ведущего в чате удаляется")
+c = cb(7, 7, "host:cards"); run(B.cb_host(c))
+ok(c.answer.items[0] == ("Карточки отправлены.", False) and not c.message.markup_removed, "главная панель: кнопки остаются")
+c = cb(7, 7, "host:kc:101"); run(B.cb_host(c)); ok(c.message.markup_removed, "выбор игрока: кнопки убраны")
+c = cb(7, 7, "host:ko:101"); run(B.cb_host(c)); ok(not g.players[101].alive, "исключение через кнопку подтверждения")
+c = cb(100, 100, "host:cards"); run(B.cb_host(c)); ok(c.answer.items[0][1] is True, "игрок не может нажимать кнопки ведущего")
+m = msg(101, GROUP); run(B.group_guard(m)); ok(m.deleted, "исключённый не может писать в чат")
+run(B.cb_host(cb(7, 7, "host:stop"))); c = cb(7, 7, "host:so"); run(B.cb_host(c))
+ok(GROUP not in E.sessions, "ведущий остановил игру кнопкой")
+m = msg(500, GROUP); run(B.group_guard(m)); ok(not m.deleted, "после игры писать снова могут все")
+
+# настройки и фото
+fb.retry_once.add(88)
+mid = run(mess.send_photo(88, b"\x89PNGdata", "подпись" * 300, None))
+ph = fb.photos[-1]
+ok(mid and ph[0] == 88 and ph[1].data == b"\x89PNGdata" and len(ph[2]) == 1024, "фото: повтор при лимите, подпись обрезана до 1024")
+fb.forbidden.add(89)
+try:
+    run(mess.send_photo(89, b"x", "c")); ok(False, "фото заблокированному")
+except B.DeliveryError:
+    ok(True, "фото заблокированному: DeliveryError")
+ok(B.CARD_RENDERER is not None, "рисовальщик карточек найден (Pillow и шрифт на месте)")
+E.card_renderer = B.CARD_RENDERER
+m = msg(8, GROUP); run(B.cmd_bunker(m))
+c = cb(100, GROUP, "lobby:settings"); run(B.cb_lobby_settings(c)); ok(c.answer.items[0][1] is True, "настройки: только создатель")
+c = cb(8, GROUP, "lobby:settings"); run(B.cb_lobby_settings(c))
+kb = [mk for ch, t, mk, _ in fb.sent if ch == GROUP][-1]
+ok(c.answer.items[0][1] is False and [b.callback_data for row in kb.inline_keyboard for b in row] ==
+   ["set:pack", "set:tempo", "set:image", "set:outside", "set:done"], "меню настроек с кнопками")
+for d in ("set:pack", "set:image", "set:outside", "set:tempo"):
+    c = cb(8, GROUP, d); run(B.cb_setting(c)); ok(c.answer.items[0][1] is False, f"{d} переключается")
+st = E.sessions[GROUP]
+ok(st.pack == "fantasy" and st.image_cards and st.outside and st.tempo == "fast", "настройки применены")
+for uid in range(100, 105):
+    run(B.cmd_start(msg(uid, uid, "private", name=f"Игрок{uid}", username=f"user_{uid}"), Obj(args=f"join_{GROUP}")))
+run(B.cb_lobby_start(cb(8, GROUP, "lobby:start")))
+cards = [p for p in fb.photos if 100 <= p[0] <= 104]
+ok(len(cards) == 5 and all(p[1].data[:4] == b"\x89PNG" for p in cards), "игрокам пришли карточки картинкой через Telegram-слой")
+c = cb(8, GROUP, "set:pack"); run(B.cb_setting(c)); ok(c.answer.items[0][1] is True, "после старта настройки не меняются")
+m = msg(8, GROUP); run(B.cmd_stop(m)); ok(GROUP not in E.sessions, "игра остановлена")
+
 registered = {f.__name__ for _, f in B.router.messages} | {f.__name__ for _, f in B.router.callbacks}
 expected = {"cmd_start", "cmd_help", "cmd_rules", "cmd_bunker", "cmd_stop", "cmd_table", "cmd_profile", "cmd_top",
             "cmd_history", "cb_lobby_leave", "cb_lobby_start", "cb_lobby_cancel", "cb_ready", "cb_vote", "cb_open",
-            "cb_card_use", "cb_card_target", "cb_card_key"}
+            "cb_card_use", "cb_card_target", "cb_card_key", "cb_lobby_host", "cb_host", "group_guard",
+            "cb_lobby_settings", "cb_setting"}
 ok(expected <= registered, "все обработчики зарегистрированы в роутере")
+ok(B.router.messages[-1][1].__name__ == "group_guard", "охрана чата зарегистрирована последней, после команд")
 datas = set()
 for c, t, mk, _ in fb.sent:
     if mk:

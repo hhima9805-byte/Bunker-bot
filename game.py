@@ -5,13 +5,14 @@ from dataclasses import dataclass, field
 
 import content
 
-TRAIT_KEYS = ["profession", "bio", "health", "hobby", "phobia", "baggage", "fact"]
+TRAIT_KEYS = ["profession", "bio", "health", "hobby", "phobia", "character", "baggage", "fact"]
 TRAIT_TITLES = {
     "profession": "Профессия",
     "bio": "Биология",
     "health": "Здоровье",
     "hobby": "Хобби",
     "phobia": "Фобия",
+    "character": "Характер",
     "baggage": "Багаж",
     "fact": "Факт",
 }
@@ -37,6 +38,21 @@ CARDS = {
 
 LOBBY, OPENING, DISCUSSION, VOTING, ENDED = "lobby", "opening", "discussion", "voting", "ended"
 
+# События, которые может запустить ведущий: код -> (название, описание для меню)
+EVENTS = {
+    "fire": ("Пожар на складе", "Сгорела часть припасов: мест в бункере становится на одно меньше."),
+    "room": ("Найдена запертая комната", "В бункере нашлось место ещё для одного человека."),
+    "quake": ("Землетрясение", "Бункер повреждён, припасов хватит на год меньше."),
+    "stash": ("Найден тайник с припасами", "Припасов хватит на год больше."),
+    "outbreak": ("Вспышка болезни", "У одного случайного игрока ухудшается здоровье. Кто это, знает только он."),
+    "medcheck": ("Медосмотр", "Все игроки раскрывают здоровье."),
+    "search": ("Обыск", "Все игроки раскрывают багаж."),
+    "mixup": ("Перепутанный багаж", "Два случайных игрока меняются багажом."),
+}
+
+# Что нужно, чтобы выжить снаружи, помимо потребностей катастрофы
+OUTSIDE_NEEDS = ("defense", "food", "water")
+
 
 @dataclass
 class Trait:
@@ -50,6 +66,7 @@ class Trait:
 class Player:
     user_id: int
     name: str
+    username: str = None
     traits: dict = field(default_factory=dict)
     opened: set = field(default_factory=set)
     alive: bool = True
@@ -63,7 +80,7 @@ class Tally:
     player: Player = None     # исключаемый игрок (для eliminate/random)
     tied: list = field(default_factory=list)    # кандидаты (для tie)
     counts: dict = field(default_factory=dict)  # user_id -> очки
-    voters: dict = field(default_factory=dict)  # target_id -> [имена проголосовавших]
+    voters: dict = field(default_factory=dict)  # target_id -> [(voter_id, вес)]
     note: str = ""
 
 
@@ -73,6 +90,9 @@ class CardResult:
     error: str = ""
     public: str = ""
     private: str = ""
+    code: str = None
+    target_id: int = None
+    key: str = None
 
 
 def _age_word(age):
@@ -87,8 +107,11 @@ def seats_for(players_count):
 
 
 class BunkerGame:
-    def __init__(self, rng=None):
+    def __init__(self, rng=None, pack="realism", outside=False):
         self.rng = rng or random.Random()
+        self.pack = pack if pack in content.PACK_NAMES else "realism"
+        self.outside = outside          # финал «снаружи»: исключённые оцениваются как вторая группа
+        self.years = 0
         self.players = {}
         self.phase = LOBBY
         self.round = 0
@@ -107,14 +130,14 @@ class BunkerGame:
 
     # ---------- лобби ----------
 
-    def add_player(self, user_id, name, max_players):
+    def add_player(self, user_id, name, max_players, username=None):
         if self.phase != LOBBY:
             return False, "Игра уже началась."
         if user_id in self.players:
             return False, "Вы уже в игре."
         if len(self.players) >= max_players:
             return False, f"Максимум игроков: {max_players}."
-        self.players[user_id] = Player(user_id, name)
+        self.players[user_id] = Player(user_id, name, username)
         return True, ""
 
     def remove_player(self, user_id):
@@ -131,8 +154,10 @@ class BunkerGame:
         if len(self.players) < min_players:
             raise ValueError(f"Нужно минимум {min_players} игроков. Сейчас: {len(self.players)}.")
         self.seats = seats_for(len(self.players))
-        self.catastrophe = self.rng.choice(content.CATASTROPHES)
-        self.bunker = self.rng.choice(content.BUNKERS)
+        catastrophes, bunkers = content.scenario_pools(self.pack)
+        self.catastrophe = self.rng.choice(catastrophes)
+        self.bunker = self.rng.choice(bunkers)
+        self.years = self.bunker["years"]
         needs = list(self.catastrophe["needs"])
         for tag in self.bunker["lacks"]:
             if tag not in needs:
@@ -144,12 +169,18 @@ class BunkerGame:
 
     # ---------- генерация карточек ----------
 
+    def _pick(self, key, exclude, text_of, weight_of=None):
+        """Выбор из основного списка или особого списка набора (в половине случаев, если он есть)"""
+        base, extra = content.trait_pools(self.pack, key)
+        extra = [x for x in extra if text_of(x) not in exclude]
+        pool = extra if extra and self.rng.random() < 0.5 else [x for x in base if text_of(x) not in exclude]
+        pool = pool or base
+        if weight_of:
+            return self.rng.choices(pool, weights=[weight_of(x) for x in pool], k=1)[0]
+        return self.rng.choice(pool)
+
     def _make_trait(self, key, exclude=()):
         rng = self.rng
-        if key == "profession":
-            pool = [p for p in content.PROFESSIONS if p[0] not in exclude]
-            text, tags = rng.choice(pool or content.PROFESSIONS)
-            return Trait(text, tuple(tags))
         if key == "bio":
             gender = rng.choice(["м", "ж"])
             age = int(min(75, max(18, rng.gauss(38, 13))))
@@ -162,26 +193,22 @@ class BunkerGame:
             return Trait(f"{word}, {age} {_age_word(age)}, {kids}", (), 0,
                          {"gender": gender, "age": age, "fertile": fertile})
         if key == "health":
-            pool = [h for h in content.HEALTH if h[0] not in exclude] or content.HEALTH
-            weights = [{0: 4, 1: 4, 2: 2, 3: 1}[h[1]] for h in pool]
-            text, severity, tags = rng.choices(pool, weights=weights, k=1)[0]
+            text, severity, tags = self._pick(key, exclude, lambda h: h[0],
+                                              lambda h: {0: 4, 1: 4, 2: 2, 3: 1}[h[1]])
             return Trait(text, tuple(tags), severity)
-        if key == "hobby":
-            pool = [h for h in content.HOBBIES if h[0] not in exclude]
-            text, tags = rng.choice(pool or content.HOBBIES)
-            return Trait(text, tuple(tags))
         if key == "phobia":
-            pool = [p for p in content.PHOBIAS if p not in exclude]
-            return Trait(rng.choice(pool or content.PHOBIAS))
-        if key == "baggage":
-            pool = [b for b in content.BAGGAGE if b[0] not in exclude]
-            text, tags = rng.choice(pool or content.BAGGAGE)
-            return Trait(text, tuple(tags))
-        if key == "fact":
-            pool = [f for f in content.FACTS if f[0] not in exclude]
-            text, tags = rng.choice(pool or content.FACTS)
+            return Trait(self._pick(key, exclude, lambda p: p))
+        if key in ("profession", "hobby", "character", "baggage", "fact"):
+            text, tags = self._pick(key, exclude, lambda x: x[0])
             return Trait(text, tuple(tags))
         raise KeyError(key)
+
+    def worse_health(self, exclude_text):
+        """Новое состояние здоровья тяжести 2-3 (для события «Вспышка болезни»)"""
+        base, extra = content.trait_pools(self.pack, "health")
+        pool = [h for h in base + extra if h[1] >= 2 and h[0] != exclude_text]
+        text, severity, tags = self.rng.choice(pool)
+        return Trait(text, tuple(tags), severity)
 
     def _deal_cards(self):
         used = {key: set() for key in TRAIT_KEYS}
@@ -327,8 +354,7 @@ class BunkerGame:
                 continue
             weight = 2 if voter_id in self.double else 1
             counts[target_id] += weight
-            label = voter.name + (" (x2)" if weight == 2 else "")
-            voters.setdefault(target_id, []).append(label)
+            voters.setdefault(target_id, []).append((voter_id, weight))
 
         if not counts:
             pool = [p for p in self.alive() if p.user_id not in self.immune]
@@ -360,6 +386,78 @@ class BunkerGame:
         p.alive = False
         self.elimination_order.append(user_id)
         return p
+
+    # ---------- действия ведущего ----------
+
+    def replace_trait(self, user_id, key):
+        """Заменить любую характеристику игрока. Возвращает (старое, новое) значения"""
+        p = self.players.get(user_id)
+        if not p or not p.alive:
+            raise ValueError("Игрок уже не участвует.")
+        if key not in TRAIT_KEYS:
+            raise ValueError("Неизвестная характеристика.")
+        old = p.traits[key].text
+        p.traits[key] = self._make_trait(key, exclude={old})
+        return old, p.traits[key].text
+
+    def force_open(self, user_id, key):
+        p = self.players.get(user_id)
+        if not p or not p.alive:
+            raise ValueError("Игрок уже не участвует.")
+        if key not in TRAIT_KEYS:
+            raise ValueError("Неизвестная характеристика.")
+        if key in p.opened:
+            raise ValueError("Эта характеристика уже раскрыта.")
+        p.opened.add(key)
+        return p.traits[key].text
+
+    def kick(self, user_id):
+        """Исключение ведущим в любой фазе"""
+        p = self.players.get(user_id)
+        if not p or not p.alive:
+            raise ValueError("Игрок уже не участвует.")
+        self.votes.pop(user_id, None)
+        self.ready.discard(user_id)
+        return self.eliminate(user_id)
+
+    def apply_event(self, code):
+        """Событие ведущего. Возвращает словарь с результатом для объявления."""
+        if code not in EVENTS:
+            raise ValueError("Неизвестное событие.")
+        alive = self.alive()
+        if code == "fire":
+            if self.seats <= 1:
+                raise ValueError("Мест в бункере уже минимум.")
+            self.seats -= 1
+            return {"code": code, "seats": self.seats}
+        if code == "room":
+            self.seats += 1
+            return {"code": code, "seats": self.seats}
+        if code == "quake":
+            if self.years <= 1:
+                raise ValueError("Припасов и так меньше чем на два года.")
+            self.years -= 1
+            return {"code": code, "years": self.years}
+        if code == "stash":
+            self.years += 1
+            return {"code": code, "years": self.years}
+        if code == "outbreak":
+            victim = self.rng.choice(alive)
+            old = victim.traits["health"].text
+            victim.traits["health"] = self.worse_health(old)
+            return {"code": code, "player": victim, "old": old, "new": victim.traits["health"].text,
+                    "public": "health" in victim.opened}
+        if code in ("medcheck", "search"):
+            key = "health" if code == "medcheck" else "baggage"
+            for p in alive:
+                p.opened.add(key)
+            return {"code": code, "key": key, "players": alive}
+        if code == "mixup":
+            if len(alive) < 2:
+                raise ValueError("Недостаточно игроков.")
+            a, b = self.rng.sample(alive, 2)
+            a.traits["baggage"], b.traits["baggage"] = b.traits["baggage"], a.traits["baggage"]
+            return {"code": code, "players": [a, b], "public": "baggage" in a.opened or "baggage" in b.opened}
 
     def finished(self):
         return len(self.alive()) <= self.seats
@@ -393,7 +491,7 @@ class BunkerGame:
         if code == "double":
             self.double.add(user_id)
             p.card_used = True
-            return CardResult(True, private="Двойной голос активирован до конца раунда.")
+            return CardResult(True, private="Двойной голос активирован до конца раунда.", code=code)
 
         if code == "immunity":
             self.immune.add(user_id)
@@ -403,7 +501,7 @@ class BunkerGame:
                 del self.votes[voter_id]
             return CardResult(True, public=f"{p.name} использует карту «Иммунитет»: "
                                            f"голоса против него в этом раунде не учитываются.",
-                              private="Иммунитет активирован до конца раунда.")
+                              private="Иммунитет активирован до конца раунда.", code=code)
 
         if code == "reroll":
             if key not in TRAIT_KEYS or key in p.opened:
@@ -412,7 +510,7 @@ class BunkerGame:
             p.traits[key] = self._make_trait(key, exclude={old})
             p.card_used = True
             return CardResult(True, private=f"{TRAIT_TITLES[key]} заменена.\n"
-                                            f"Было: {old}\nСтало: {p.traits[key].text}")
+                                            f"Было: {old}\nСтало: {p.traits[key].text}", code=code, key=key)
 
         if code == "reveal":
             pick = self.rng.choice(self.unopened_keys(target_id))
@@ -420,27 +518,37 @@ class BunkerGame:
             p.card_used = True
             return CardResult(True, public=f"{p.name} использует карту «Принудительное раскрытие». "
                                            f"{target.name} раскрывает характеристику "
-                                           f"«{TRAIT_TITLES[pick]}»: {target.traits[pick].text}")
+                                           f"«{TRAIT_TITLES[pick]}»: {target.traits[pick].text}",
+                              code=code, target_id=target_id, key=pick)
 
         if code == "peek":
             pick = self.rng.choice(self.unopened_keys(target_id))
             p.card_used = True
             return CardResult(True, private=f"Разведка: у игрока {target.name} "
-                                            f"характеристика «{TRAIT_TITLES[pick]}»: {target.traits[pick].text}")
+                                            f"характеристика «{TRAIT_TITLES[pick]}»: {target.traits[pick].text}",
+                              code=code, target_id=target_id, key=pick)
 
         return CardResult(False, "Неизвестная карта.")
 
     # ---------- итоги ----------
 
-    def verdict(self):
-        """Оценка шансов выживших"""
-        survivors = self.alive()
+    def verdict(self, outside=False):
+        """Оценка шансов группы: выживших в бункере или исключённых снаружи"""
+        if outside:
+            survivors = [p for p in self.players.values() if not p.alive]
+            needs = list(self.catastrophe["needs"])
+            for t in OUTSIDE_NEEDS:
+                if t not in needs:
+                    needs.append(t)
+        else:
+            survivors = self.alive()
+            needs = list(self.needs)
         have = set()
         for p in survivors:
-            for key in ("profession", "hobby", "baggage", "fact"):
+            for key in ("profession", "hobby", "character", "baggage", "fact"):
                 have |= set(p.traits[key].tags)
-        covered = [t for t in self.needs if t in have]
-        missing = [t for t in self.needs if t not in have]
+        covered = [t for t in needs if t in have]
+        missing = [t for t in needs if t not in have]
 
         health_load = sum(p.traits["health"].severity for p in survivors)
         severe = [p for p in survivors if p.traits["health"].severity >= 3]
@@ -452,10 +560,15 @@ class BunkerGame:
                           for p in survivors)
         future_ok = fertile_women and fertile_men
 
-        skills = 60 * len(covered) / max(1, len(self.needs))
+        skills = 60 * len(covered) / max(1, len(needs))
         future = 20 if future_ok else (10 if (fertile_women or fertile_men) else 0)
-        health = max(0, 20 - 3 * health_load)
-        score = int(round(max(0, skills + future + health - 10 * len(contagious))))
+        health = max(0, 20 - (5 if outside else 3) * health_load)   # снаружи болезни опаснее
+        score = skills + future + health - 10 * len(contagious)
+        if outside:
+            score -= 15   # без укрытия выжить труднее
+        if not survivors:
+            score = 0
+        score = int(round(max(0, score)))
         score = min(100, score)
 
         if score >= 75:
@@ -472,5 +585,15 @@ class BunkerGame:
             "severe": severe,
             "contagious": contagious,
             "future_ok": future_ok,
-            "years": self.bunker["years"],
+            "years": self.years,
+            "size": len(survivors),
         }
+
+    def final_result(self):
+        """Итог с учётом финала «снаружи»: (вердикт бункера, вердикт снаружи или None, победители)"""
+        inside = self.verdict()
+        if not self.outside:
+            return inside, None, "inside"
+        outside = self.verdict(outside=True)
+        winner = "outside" if outside["score"] > inside["score"] else "inside"   # при равенстве — бункер
+        return inside, outside, winner

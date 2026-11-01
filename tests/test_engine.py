@@ -73,10 +73,11 @@ def run(c):
     return asyncio.run(c)
 
 
-async def lobby(e, n=5, chat=GROUP, creator=1, base=100, names=None):
-    await e.create_lobby(chat, creator)
+async def lobby(e, n=5, chat=GROUP, creator=1, base=100, names=None, usernames=None):
+    await e.create_lobby(chat, creator, "Создатель", None)
     for i in range(n):
-        r = await e.join(chat, base + i, (names or {}).get(base + i, f"Игрок{i + 1}"))
+        r = await e.join(chat, base + i, (names or {}).get(base + i, f"Игрок{i + 1}"),
+                         (usernames or {}).get(base + i))
         assert r[0], r
     return e.sessions[chat]
 
@@ -98,7 +99,7 @@ async def t_lobby():
     ok(not (await e.create_lobby(GROUP, 2))[0], "второй набор в том же чате запрещён")
     ok((await e.join(GROUP, 10, "Аня"))[0] and not (await e.join(GROUP, 10, "Аня"))[0], "повторный вход отклонён")
     await asyncio.sleep(0.05)
-    ok(any("1. Аня" in t for _, _, t, _, _ in m.edits), "лобби обновляется при входе")
+    ok(any('1. <a href="tg://user?id=10">Аня</a>' in t for _, _, t, _, _ in m.edits), "лобби обновляется при входе")
     await e.create_lobby(-5, 3)
     ok(not (await e.join(-5, 10, "Аня"))[0], "нельзя участвовать в двух играх сразу")
     ok((await e.leave(GROUP, 10))[0] and 10 not in e.user_chat, "выход из лобби освобождает игрока")
@@ -124,7 +125,7 @@ async def t_throttle():
     await asyncio.sleep(0.9)
     edits = [x for x in m.edits if x[0] == GROUP]
     ok(1 <= len(edits) <= 3, f"12 входов подряд дали {len(edits)} правки лобби, а не 12")
-    ok("12. T11" in edits[-1][2], "последняя правка показывает актуальный состав")
+    ok('12. <a href="tg://user?id=411">T11</a>' in edits[-1][2], "последняя правка показывает актуальный состав")
     gaps = [b[4] - a[4] for a, b in zip(edits, edits[1:])]
     ok(all(gp >= 0.28 for gp in gaps), "правки не чаще заданного интервала")
 run(t_throttle())
@@ -142,7 +143,7 @@ async def t_start():
     for uid in (100, 101, 102, 103, 300):
         dm = [t for t in m.texts(uid) if "секретная карточка" in t]
         ok(len(dm) == 1 and all(G.TRAIT_TITLES[k] in dm[0] for k in G.TRAIT_KEYS) and "Особая карта" in dm[0],
-           f"карточка с 7 характеристиками и особой картой у игрока {uid}")
+           f"карточка с 8 характеристиками и особой картой у игрока {uid}")
     ok(m.has(GROUP, "Катастрофа") and m.has(GROUP, "Мест в бункере: <b>2</b>") and m.has(GROUP, "Нужно исключить: <b>3</b>"),
        "объявление: катастрофа, бункер, 2 места, исключить 3")
     ok(m.last_buttons(100, "card:use") is not None, "в карточке есть кнопка особой карты")
@@ -160,12 +161,15 @@ run(t_start())
 # ---------- полный ход раунда ----------
 async def t_flow():
     e, m = mk_engine(fast(min_players=5, open_seconds=5, discuss_seconds=5, vote_seconds=5, revote_seconds=5))
-    s = await lobby(e, 5, names={102: "<b>Хакер</b> & Co"}); g = s.game
+    s = await lobby(e, 5, names={102: "<b>Хакер</b> & Co"}, usernames={101: "boris_k", 103: "bad name!"}); g = s.game
     await e.start(GROUP, 1)
     await wait_phase(g, G.DISCUSSION)
     ok(m.has(GROUP, "Раунд 1") and m.has(GROUP, "Первый раунд: все раскрывают профессию"), "раунд 1: профессии раскрыты автоматически")
     ok(m.has(GROUP, "&lt;b&gt;Хакер&lt;/b&gt; &amp; Co") and not m.has(GROUP, "<b>Хакер</b>"), "имена экранируются (нет HTML-инъекции)")
     ok(m.has(GROUP, "<b>Стол</b>"), "показан стол")
+    ok(m.has(GROUP, "@boris_k"), "игрок с username упоминается через @")
+    ok(m.has(GROUP, '<a href="tg://user?id=100">Игрок1</a>'), "игрок без username — имя-ссылка на профиль")
+    ok(m.has(GROUP, '<a href="tg://user?id=103">') and not m.has(GROUP, "@bad name!"), "некорректный username не используется")
     t0 = time.time()
     for uid in (100, 101, 102):
         await e.on_ready(GROUP, uid)
@@ -180,7 +184,8 @@ async def t_flow():
     ok(any("Проголосовали: 4/5" in t for _, _, t, _, _ in m.edits), "счётчик голосов обновляется")
     await e.on_vote(GROUP, 104, 100)
     await wait_phase(g, G.OPENING, 2)
-    ok(m.has(GROUP, "Итоги голосования") and m.has(GROUP, "Из бункера исключён: <b>Игрок5</b>") and 104 not in e.user_chat,
+    ok(m.has(GROUP, "Итоги голосования") and m.has(GROUP, 'Из бункера исключён: <a href="tg://user?id=104">Игрок5</a>')
+       and 104 not in e.user_chat,
        "исключён Игрок5, итоги с составом проголосовавших")
     ok(m.has(104, "Вы исключены из бункера") and m.has(GROUP, "Все характеристики исключённого игрока"),
        "исключённому личное сообщение, всем показаны его карточки")
@@ -278,7 +283,8 @@ async def t_full():
     s = await lobby(e, 7)
     await e.start(GROUP, 1)
     await asyncio.wait_for(s.task, 15)
-    ok(m.has(GROUP, "Игра окончена") and m.has(GROUP, "Шансы группы на выживание") and m.has(GROUP, "Карточки выживших"),
+    ok(m.has(GROUP, "Игра окончена") and m.has(GROUP, "Шансы на выживание") and m.has(GROUP, "Карточки выживших")
+       and not m.has(GROUP, "Группа снаружи"),
        "итог игры: состав, оценка, карточки")
     ok(GROUP not in e.sessions and not e.user_chat, "после игры чат и игроки свободны")
     p = e.storage.profile(100); ok(p["games"] == 1 and p["survived"] + p["eliminated"] == 1, "статистика записана")
@@ -300,6 +306,126 @@ async def t_error():
     await asyncio.wait_for(s.task, 5)
     ok(m.has(GROUP, "внутренней ошибки") and GROUP not in e.sessions, "при сбое игра останавливается с сообщением и очищается")
 run(t_error())
+
+
+# ---------- режим ведущего ----------
+async def t_host_mode():
+    e, m = mk_engine(fast(min_players=5, open_seconds=5, discuss_seconds=5, vote_seconds=5, revote_seconds=5), seed=11)
+    await e.create_lobby(GROUP, 1, "Ведущий Олег", "oleg_host")
+    await e.join(GROUP, 1, "Ведущий Олег", "oleg_host")
+    ok(1 in e.sessions[GROUP].game.players, "создатель может играть (по умолчанию)")
+    ok(not (await e.toggle_host(GROUP, 100))[0], "режим ведущего включает только создатель")
+    m.blocked.add(1)
+    r = await e.toggle_host(GROUP, 1)
+    ok(not r[0] and "Старт" in r[1] and not e.sessions[GROUP].host_mode, "без «Старт» у бота режим ведущего не включается")
+    m.blocked.discard(1)
+    r = await e.toggle_host(GROUP, 1)
+    s = e.sessions[GROUP]; g = s.game
+    ok(r[0] and s.host_mode and 1 not in g.players and 1 not in e.user_chat and e.host_chat[1] == GROUP,
+       "режим ведущего: создатель убран из игроков")
+    ok(not (await e.join(GROUP, 1, "Ведущий Олег"))[0], "ведущий не может войти в игру")
+    await asyncio.sleep(0.05)
+    ok(any("Ведущий: @oleg_host" in t for _, _, t, _, _ in m.edits), "в наборе указан ведущий")
+    r = await e.toggle_host(GROUP, 1); ok(r[0] and not s.host_mode and 1 not in e.host_chat, "режим ведущего выключается")
+    await e.toggle_host(GROUP, 1)
+    for i in range(6):
+        await e.join(GROUP, 100 + i, f"Игрок{i + 1}", f"player_{i + 1}")
+    ok((await e.start(GROUP, 1))[0], "игра с ведущим стартовала")
+    ok(m.last_buttons(1, "host:") is not None and m.has(1, "Панель ведущего"), "ведущему пришла панель")
+    ok(not any("секретная карточка" in t for t in m.texts(1)), "ведущему не пришла карточка игрока")
+    ok(m.has(GROUP, "Ведущий: @oleg_host"), "ведущий объявлен в начале игры")
+    await wait_phase(g, G.DISCUSSION)
+
+    ok(not (await e.on_host(100, "host:cards"))[0], "игрок не может открыть панель ведущего")
+    r = await e.on_host(1, "host:cards")
+    cards = m.texts(1)[-1]
+    ok(r[0] and all(g.players[u].traits["fact"].text in cards for u in range(100, 106)) and "[раскрыто]" in cards,
+       "ведущий видит все карточки с пометкой раскрытого")
+
+    r = await e.on_host(1, "host:rp:101"); ok(r[0] and m.last_buttons(1, "host:rk:") is not None, "замена: выбор характеристики")
+    old = g.players[101].traits["hobby"].text
+    r = await e.on_host(1, "host:rk:101:hobby")
+    ok(r[0] and g.players[101].traits["hobby"].text != old and m.has(GROUP, "заменил одну из нераскрытых")
+       and not m.has(GROUP, esc_new := g.players[101].traits["hobby"].text) and m.has(101, "Было:"),
+       "замена скрытой: в чате без значения, игроку пришли старое и новое")
+    r = await e.on_host(1, "host:rk:101:profession")
+    ok(r[0] and m.has(GROUP, "Новое значение") and m.has(GROUP, "«Профессия» у @player_2"), "замена раскрытой объявлена со значением")
+
+    r = await e.on_host(1, "host:rvk:102:phobia")
+    ok(r[0] and "phobia" in g.players[102].opened and m.has(GROUP, "Ведущий раскрыл характеристику «Фобия» у @player_3"),
+       "ведущий раскрыл характеристику, объявлено в чате")
+    ok(not (await e.on_host(1, "host:rvk:102:phobia"))[0], "повторное раскрытие отклонено")
+    ok(not (await e.on_host(1, "host:rk:999:hobby"))[0] and not (await e.on_host(1, "host:rp:abc"))[0], "битые данные отклонены")
+
+    r = await e.on_host(1, "host:kc:103"); ok(r[0] and m.last_buttons(1, "host:ko:") is not None, "исключение требует подтверждения")
+    ok(g.players[103].alive, "до подтверждения игрок в игре")
+    r = await e.on_host(1, "host:ko:103")
+    ok(r[0] and not g.players[103].alive and m.has(GROUP, "Ведущий исключил из игры: @player_4") and m.has(103, "Вы исключены"),
+       "ведущий исключил игрока")
+    ok(not (await e.on_host(1, "host:ko:103"))[0], "повторно исключить нельзя")
+
+    r = await e.on_host(1, "host:skip"); ok(r[0] and m.has(GROUP, "Ведущий завершил обсуждение досрочно"), "ведущий завершил обсуждение")
+    await wait_phase(g, G.VOTING, 2)
+    for v, t in {100: 101, 101: 100, 102: 101, 104: 101}.items():
+        await e.on_vote(GROUP, v, t)
+    r = await e.on_host(1, "host:ko:101")   # исключён лидер голосования, мест 3, осталось 4
+    await asyncio.sleep(0.05)
+    ok(not g.players[101].alive and g.phase == G.VOTING, "исключение во время голосования")
+    await e.on_vote(GROUP, 105, 100)
+    await asyncio.wait_for(s.task, 5)
+    ok(len(g.alive()) == 3 and g.elimination_order.count(101) == 1, "исключённый ведущим не выбывает второй раз, мест ровно 3")
+    ok(m.has(GROUP, "Игра окончена") and 1 not in e.host_chat, "игра завершилась, ведущий освобождён")
+run(t_host_mode())
+
+
+async def t_host_ends_game():
+    e, m = mk_engine(fast(min_players=5, open_seconds=5, discuss_seconds=5, vote_seconds=5), seed=12)
+    await e.create_lobby(GROUP, 1, "В", None); await e.toggle_host(GROUP, 1)
+    for i in range(5):
+        await e.join(GROUP, 100 + i, f"Игрок{i + 1}")
+    await e.start(GROUP, 1); s = e.sessions[GROUP]; g = s.game
+    await wait_phase(g, G.DISCUSSION)
+    await e.on_host(1, "host:ko:100"); await e.on_host(1, "host:ko:101"); await e.on_host(1, "host:ko:102")
+    await asyncio.wait_for(s.task, 5)
+    ok(len(g.alive()) == 2 == g.seats and m.has(GROUP, "Игра окончена"), "исключения ведущего до числа мест завершают игру")
+
+    e, m = mk_engine(fast(min_players=5, open_seconds=5, discuss_seconds=5, vote_seconds=5), seed=13)
+    await e.create_lobby(GROUP, 1, "В", None); await e.toggle_host(GROUP, 1)
+    for i in range(5):
+        await e.join(GROUP, 100 + i, f"Игрок{i + 1}")
+    await e.start(GROUP, 1); g = e.sessions[GROUP].game
+    await wait_phase(g, G.DISCUSSION)
+    r = await e.on_host(1, "host:stop"); ok(r[0] and m.last_buttons(1, "host:so") is not None, "остановка требует подтверждения")
+    r = await e.on_host(1, "host:so"); ok(r[0] and GROUP not in e.sessions and m.has(GROUP, "Игра остановлена"), "ведущий остановил игру")
+
+    e, m = mk_engine(fast(min_players=5, open_seconds=5, discuss_seconds=5, vote_seconds=5), seed=14)
+    s = await lobby(e, 5); await e.start(GROUP, 1)
+    ok(not (await e.on_host(1, "host:cards"))[0], "играющий создатель не получает панель ведущего")
+    await e.cancel(GROUP, 1)
+run(t_host_ends_game())
+
+
+# ---------- тишина в чате ----------
+async def t_silence():
+    e, m = mk_engine(fast(min_players=5, open_seconds=5, discuss_seconds=5, vote_seconds=5, notice_interval=0.2))
+    await e.create_lobby(GROUP, 1, "В", None); await e.toggle_host(GROUP, 1)
+    for i in range(5):
+        await e.join(GROUP, 100 + i, f"Игрок{i + 1}")
+    ok(not e.is_silenced(GROUP, 777), "в наборе писать могут все")
+    await e.start(GROUP, 1); g = e.sessions[GROUP].game
+    await wait_phase(g, G.DISCUSSION)
+    ok(not e.is_silenced(GROUP, 100), "живой игрок может писать")
+    ok(e.is_silenced(GROUP, 777), "зритель (в том числе владелец или админ) не может писать")
+    ok(e.is_silenced(GROUP, 1), "не играющий ведущий не может писать")
+    ok(e.is_silenced(GROUP, None), "анонимный админ и каналы не могут писать")
+    await e.on_host(1, "host:ko:100")
+    ok(e.is_silenced(GROUP, 100), "исключённый не может писать")
+    ok(not e.is_silenced(-555, 777), "в чате без игры ограничений нет")
+    ok(e.should_notify(GROUP, 777) and not e.should_notify(GROUP, 777), "напоминание не чаще заданного интервала")
+    await asyncio.sleep(0.25); ok(e.should_notify(GROUP, 777), "через интервал напоминание снова отправляется")
+    await e.cancel(GROUP, 1)
+    ok(not e.is_silenced(GROUP, 777), "после остановки писать могут все")
+run(t_silence())
 
 
 # ---------- 30 игр одновременно ----------
